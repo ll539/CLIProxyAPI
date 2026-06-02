@@ -101,7 +101,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	}
 
 	mainModel := e.resolveGPTImage2BaseModel()
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), mainModel, auth)
+	reporter := helps.NewExecutorUsageReporter(ctx, e, mainModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	body, errBuild := e.prepareCodexOpenAIImageBody(prepared.Body, req, opts, mainModel)
@@ -851,7 +851,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	}
 
 	mainModel := e.resolveGPTImage2BaseModel()
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), mainModel, auth)
+	reporter := helps.NewExecutorUsageReporter(ctx, e, mainModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	body, errBuild := e.prepareCodexOpenAIImageBody(prepared.Body, req, opts, mainModel)
