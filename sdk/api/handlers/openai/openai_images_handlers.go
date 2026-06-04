@@ -1335,7 +1335,54 @@ func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte
 	if len(toolJSON) > 0 && json.Valid(toolJSON) {
 		req, _ = sjson.SetRawBytes(req, "tools.-1", toolJSON)
 	}
+	return ensureImagesResponsesImageGenerationTool(req, defaultImagesToolModel, "")
+}
+
+func ensureImagesResponsesImageGenerationTool(req []byte, fallbackModel string, action string) []byte {
+	if len(req) == 0 || !imageToolChoiceForcesImageGeneration(req) || imagesResponsesHasImageGenerationTool(req) {
+		return req
+	}
+	tools := gjson.GetBytes(req, "tools")
+	if !tools.IsArray() {
+		req, _ = sjson.SetRawBytes(req, "tools", []byte(`[]`))
+	}
+	tool := []byte(`{"type":"image_generation"}`)
+	if model := strings.TrimSpace(fallbackModel); model != "" {
+		tool, _ = sjson.SetBytes(tool, "model", model)
+	}
+	if action = strings.TrimSpace(action); action != "" {
+		tool, _ = sjson.SetBytes(tool, "action", action)
+	}
+	req, _ = sjson.SetRawBytes(req, "tools.-1", tool)
 	return req
+}
+
+func imageToolChoiceForcesImageGeneration(req []byte) bool {
+	choice := gjson.GetBytes(req, "tool_choice")
+	if !choice.Exists() {
+		return false
+	}
+	if choice.Type == gjson.String {
+		return strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation")
+	}
+	choiceType := strings.TrimSpace(choice.Get("type").String())
+	if strings.EqualFold(choiceType, "image_generation") {
+		return true
+	}
+	return strings.EqualFold(choiceType, "tool") && strings.EqualFold(strings.TrimSpace(choice.Get("name").String()), "image_generation")
+}
+
+func imagesResponsesHasImageGenerationTool(req []byte) bool {
+	tools := gjson.GetBytes(req, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+			return true
+		}
+	}
+	return false
 }
 
 func extractXAIImagesResponse(payload []byte) (results []xaiImageResult, createdAt int64, usageRaw []byte, err error) {
@@ -1940,6 +1987,7 @@ func (h *OpenAIAPIHandler) streamImagesWithModel(c *gin.Context, imageReq []byte
 
 func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesReq []byte, responseFormat string) {
 	c.Header("Content-Type", "application/json")
+	responsesReq = ensureImagesResponsesImageGenerationTool(responsesReq, defaultImagesToolModel, "")
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
@@ -2011,7 +2059,7 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			if len(results) == 0 {
 				reason := imageCompletedWithoutOutputReason(payload)
 				logImageCompletedWithoutOutput(ctx, payload, reason)
-				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("upstream completed without image output: %s", reason)}
+				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("upstream completed without image output: %s", reason)}
 			}
 			out, err := buildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
 			if err != nil {
@@ -2264,6 +2312,7 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 		})
 		return
 	}
+	responsesReq = ensureImagesResponsesImageGenerationTool(responsesReq, defaultImagesToolModel, imageActionFromStreamPrefix(streamPrefix))
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
@@ -2346,6 +2395,17 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 			writeImagesStreamKeepAlive(c, flusher)
 			streamStarted = true
 		}
+	}
+}
+
+func imageActionFromStreamPrefix(streamPrefix string) string {
+	switch strings.TrimSpace(streamPrefix) {
+	case "image_generation":
+		return "generate"
+	case "image_edit":
+		return "edit"
+	default:
+		return ""
 	}
 }
 

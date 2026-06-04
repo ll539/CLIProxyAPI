@@ -173,7 +173,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	if len(results) == 0 {
 		reason := codexImageCompletedWithoutOutputReason(completedData)
 		logCodexImageCompletedWithoutOutput(ctx, completedData, reason)
-		return resp, statusErr{code: http.StatusBadGateway, msg: "upstream completed without image output: " + reason}
+		return resp, statusErr{code: http.StatusServiceUnavailable, msg: "upstream completed without image output: " + reason}
 	}
 	out, errOutput := codexBuildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, prepared.ResponseFormat)
 	if errOutput != nil {
@@ -995,6 +995,7 @@ func (e *CodexExecutor) prepareCodexOpenAIImageBody(body []byte, req cliproxyexe
 	out, _ = sjson.DeleteBytes(out, "prompt_cache_retention")
 	out, _ = sjson.DeleteBytes(out, "safety_identifier")
 	out, _ = sjson.DeleteBytes(out, "stream_options")
+	out = codexEnsureImagesResponsesImageGenerationTool(out, codexOpenAIImageToolModel("", requestedModel), codexImageActionFromRequestPath(requestPath))
 	return normalizeCodexInstructions(out), nil
 }
 
@@ -1204,7 +1205,64 @@ func codexBuildImagesResponsesRequest(prompt string, images []string, toolJSON [
 	if len(toolJSON) > 0 && json.Valid(toolJSON) {
 		req, _ = sjson.SetRawBytes(req, "tools.-1", toolJSON)
 	}
+	return codexEnsureImagesResponsesImageGenerationTool(req, codexDefaultImageToolModel, "")
+}
+
+func codexEnsureImagesResponsesImageGenerationTool(req []byte, fallbackModel string, action string) []byte {
+	if len(req) == 0 || !codexImageToolChoiceForcesImageGeneration(req) || codexImagesResponsesHasImageGenerationTool(req) {
+		return req
+	}
+	tools := gjson.GetBytes(req, "tools")
+	if !tools.IsArray() {
+		req, _ = sjson.SetRawBytes(req, "tools", []byte(`[]`))
+	}
+	tool := []byte(`{"type":"image_generation"}`)
+	if model := strings.TrimSpace(fallbackModel); model != "" {
+		tool, _ = sjson.SetBytes(tool, "model", model)
+	}
+	if action = strings.TrimSpace(action); action != "" {
+		tool, _ = sjson.SetBytes(tool, "action", action)
+	}
+	req, _ = sjson.SetRawBytes(req, "tools.-1", tool)
 	return req
+}
+
+func codexImageToolChoiceForcesImageGeneration(req []byte) bool {
+	choice := gjson.GetBytes(req, "tool_choice")
+	if !choice.Exists() {
+		return false
+	}
+	if choice.Type == gjson.String {
+		return strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation")
+	}
+	choiceType := strings.TrimSpace(choice.Get("type").String())
+	if strings.EqualFold(choiceType, "image_generation") {
+		return true
+	}
+	return strings.EqualFold(choiceType, "tool") && strings.EqualFold(strings.TrimSpace(choice.Get("name").String()), "image_generation")
+}
+
+func codexImagesResponsesHasImageGenerationTool(req []byte) bool {
+	tools := gjson.GetBytes(req, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+			return true
+		}
+	}
+	return false
+}
+
+func codexImageActionFromRequestPath(requestPath string) string {
+	if strings.HasSuffix(strings.TrimSpace(requestPath), codexImagesEditsPath) {
+		return "edit"
+	}
+	if strings.HasSuffix(strings.TrimSpace(requestPath), codexImagesGenerationsPath) {
+		return "generate"
+	}
+	return ""
 }
 
 func codexFormValue(form *multipart.Form, key string) string {

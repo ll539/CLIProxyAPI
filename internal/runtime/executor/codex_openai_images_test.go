@@ -82,6 +82,42 @@ func TestCodexOpenAIImageExecutePreservesCompletedResponseShape(t *testing.T) {
 	}
 }
 
+func TestCodexBuildImagesResponsesRequestIncludesImageGenerationToolWhenForced(t *testing.T) {
+	out := codexBuildImagesResponsesRequest("draw a cat", nil, nil)
+
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "image_generation" {
+		t.Fatalf("tool_choice.type = %q, want image_generation; payload=%s", got, string(out))
+	}
+	tools := gjson.GetBytes(out, "tools")
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		t.Fatalf("tools must include image_generation tool; payload=%s", string(out))
+	}
+	if got := tools.Array()[0].Get("type").String(); got != "image_generation" {
+		t.Fatalf("tools.0.type = %q, want image_generation; payload=%s", got, string(out))
+	}
+}
+
+func TestCodexEnsureImagesResponsesImageGenerationToolRepairsMissingTools(t *testing.T) {
+	raw := []byte(`{"tool_choice":{"type":"tool","name":"image_generation"},"tools":"bad"}`)
+
+	out := codexEnsureImagesResponsesImageGenerationTool(raw, "gpt-image-2", "generate")
+
+	tools := gjson.GetBytes(out, "tools")
+	if !tools.IsArray() || len(tools.Array()) != 1 {
+		t.Fatalf("tools = %s, want one image_generation tool; payload=%s", tools.Raw, string(out))
+	}
+	tool := tools.Array()[0]
+	if got := tool.Get("type").String(); got != "image_generation" {
+		t.Fatalf("tool.type = %q, want image_generation; payload=%s", got, string(out))
+	}
+	if got := tool.Get("model").String(); got != "gpt-image-2" {
+		t.Fatalf("tool.model = %q, want gpt-image-2; payload=%s", got, string(out))
+	}
+	if got := tool.Get("action").String(); got != "generate" {
+		t.Fatalf("tool.action = %q, want generate; payload=%s", got, string(out))
+	}
+}
+
 func TestCodexOpenAIImageSSEMissingCompletedReturns502(t *testing.T) {
 	_, err := codexReadOpenAIImageResponsesSSE(context.Background(), strings.NewReader(`data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"AA=="}}
 

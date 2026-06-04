@@ -137,6 +137,42 @@ func TestImagesModelValidationAllowsOpenAICompatImageModels(t *testing.T) {
 	}
 }
 
+func TestBuildImagesResponsesRequestIncludesImageGenerationToolWhenForced(t *testing.T) {
+	out := buildImagesResponsesRequest("draw a cat", nil, nil)
+
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "image_generation" {
+		t.Fatalf("tool_choice.type = %q, want image_generation; payload=%s", got, string(out))
+	}
+	tools := gjson.GetBytes(out, "tools")
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		t.Fatalf("tools must include image_generation tool; payload=%s", string(out))
+	}
+	if got := tools.Array()[0].Get("type").String(); got != "image_generation" {
+		t.Fatalf("tools.0.type = %q, want image_generation; payload=%s", got, string(out))
+	}
+}
+
+func TestEnsureImagesResponsesImageGenerationToolRepairsMissingTools(t *testing.T) {
+	raw := []byte(`{"tool_choice":{"type":"tool","name":"image_generation"},"tools":"bad"}`)
+
+	out := ensureImagesResponsesImageGenerationTool(raw, "gpt-image-2", "edit")
+
+	tools := gjson.GetBytes(out, "tools")
+	if !tools.IsArray() || len(tools.Array()) != 1 {
+		t.Fatalf("tools = %s, want one image_generation tool; payload=%s", tools.Raw, string(out))
+	}
+	tool := tools.Array()[0]
+	if got := tool.Get("type").String(); got != "image_generation" {
+		t.Fatalf("tool.type = %q, want image_generation; payload=%s", got, string(out))
+	}
+	if got := tool.Get("model").String(); got != "gpt-image-2" {
+		t.Fatalf("tool.model = %q, want gpt-image-2; payload=%s", got, string(out))
+	}
+	if got := tool.Get("action").String(); got != "edit" {
+		t.Fatalf("tool.action = %q, want edit; payload=%s", got, string(out))
+	}
+}
+
 func TestBuildXAIImagesGenerationsRequest(t *testing.T) {
 	rawJSON := []byte(`{"model":"xai/grok-imagine-image-quality","prompt":"abstract art","aspect_ratio":"landscape","resolution":"2k","n":2,"response_format":"url"}`)
 
@@ -491,7 +527,7 @@ data: {"type":"response.completed","response":{"status":"completed","output":[{"
 	if out != nil {
 		t.Fatalf("out = %s, want nil", string(out))
 	}
-	requireImagesStreamError(t, errMsg, http.StatusBadGateway, "upstream completed without image output: failed")
+	requireImagesStreamError(t, errMsg, http.StatusServiceUnavailable, "upstream completed without image output: failed")
 }
 
 func TestClassifyMultipartReadErrorTreatsNetworkFailureAsServerError(t *testing.T) {

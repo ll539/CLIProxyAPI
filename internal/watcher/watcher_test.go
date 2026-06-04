@@ -1306,6 +1306,39 @@ func TestAddOrUpdateClientEdgeCases(t *testing.T) {
 	}
 }
 
+func TestAddOrUpdateClientRetriesEmptyAuthFile(t *testing.T) {
+	authDir := t.TempDir()
+	authFile := filepath.Join(authDir, "codex.json")
+	if err := os.WriteFile(authFile, nil, 0o644); err != nil {
+		t.Fatalf("failed to create empty auth file: %v", err)
+	}
+	queue := make(chan AuthUpdate, 4)
+	w := &Watcher{
+		authDir:        authDir,
+		lastAuthHashes: make(map[string]string),
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	w.addOrUpdateClient(authFile)
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","email":"u@example.com"}`), 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	select {
+	case update := <-queue:
+		if update.Action != AuthUpdateActionAdd {
+			t.Fatalf("action = %s, want %s", update.Action, AuthUpdateActionAdd)
+		}
+		if update.Auth == nil || update.Auth.Provider != "codex" {
+			t.Fatalf("unexpected auth update: %+v", update)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for retried auth update")
+	}
+}
+
 func TestLoadFileClientsWalkError(t *testing.T) {
 	tmpDir := t.TempDir()
 	noAccessDir := filepath.Join(tmpDir, "0noaccess")

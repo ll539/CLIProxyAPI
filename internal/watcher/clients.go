@@ -22,6 +22,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	authFileReadRetryDelay    = 250 * time.Millisecond
+	authFileReadRetryAttempts = 3
+)
+
 func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh bool) {
 	log.Debugf("starting full client load process")
 
@@ -149,13 +154,19 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 }
 
 func (w *Watcher) addOrUpdateClient(path string) {
+	w.addOrUpdateClientWithRetry(path, 0)
+}
+
+func (w *Watcher) addOrUpdateClientWithRetry(path string, attempt int) {
 	data, errRead := os.ReadFile(path)
 	if errRead != nil {
 		log.Errorf("failed to read auth file %s: %v", filepath.Base(path), errRead)
+		w.scheduleAuthFileReadRetry(path, attempt, "read_failed")
 		return
 	}
 	if len(data) == 0 {
 		log.Debugf("ignoring empty auth file: %s", filepath.Base(path))
+		w.scheduleAuthFileReadRetry(path, attempt, "empty_file")
 		return
 	}
 
@@ -167,6 +178,7 @@ func (w *Watcher) addOrUpdateClient(path string) {
 	var newAuth coreauth.Auth
 	if errParse := json.Unmarshal(data, &newAuth); errParse != nil {
 		log.Errorf("failed to parse auth file %s: %v", filepath.Base(path), errParse)
+		w.scheduleAuthFileReadRetry(path, attempt, "parse_failed")
 		return
 	}
 
@@ -236,6 +248,24 @@ func (w *Watcher) addOrUpdateClient(path string) {
 	w.persistAuthAsync(fmt.Sprintf("Sync auth %s", filepath.Base(path)), path)
 	w.dispatchAuthUpdates(updates)
 	redisqueue.NotifyUsageRefresh()
+}
+
+func (w *Watcher) scheduleAuthFileReadRetry(path string, attempt int, reason string) {
+	if w == nil || attempt >= authFileReadRetryAttempts {
+		return
+	}
+	nextAttempt := attempt + 1
+	log.Debugf("scheduling auth file retry %d/%d for %s (%s)", nextAttempt, authFileReadRetryAttempts, filepath.Base(path), reason)
+	go func() {
+		time.Sleep(authFileReadRetryDelay)
+		if w.stopped.Load() {
+			return
+		}
+		if _, errStat := os.Stat(path); errStat != nil {
+			return
+		}
+		w.addOrUpdateClientWithRetry(path, nextAttempt)
+	}()
 }
 
 func (w *Watcher) removeClient(path string) {
