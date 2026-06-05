@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,20 +52,24 @@ type sseFrameAccumulator struct {
 }
 
 type imagesResponsesStreamStats struct {
-	startedAt            time.Time
-	sawFirstEvent        bool
-	sawResponseCompleted bool
-	sawErrorEvent        bool
-	lastEventType        string
-	lastDataType         string
-	finishReason         string
-	scannerErrorType     string
-	streamEndReason      string
-	chunkCount           int
-	eventCount           int
-	dataCount            int
-	imageCount           int
-	partialImageCount    int
+	startedAt              time.Time
+	sawFirstEvent          bool
+	sawResponseCompleted   bool
+	sawErrorEvent          bool
+	lastEventType          string
+	lastDataType           string
+	finishReason           string
+	scannerErrorType       string
+	streamEndReason        string
+	chunkCount             int
+	eventCount             int
+	dataCount              int
+	imageCount             int
+	partialImageCount      int
+	completedOutputCount   int
+	outputItemDoneCount    int
+	outputItemResultCount  int
+	syntheticCompletedUsed bool
 }
 
 func newImagesResponsesStreamStats() *imagesResponsesStreamStats {
@@ -110,6 +115,9 @@ func (s *imagesResponsesStreamStats) observeDataPayload(payload []byte) {
 			s.sawResponseCompleted = true
 			s.observeCompletedPayload(payload)
 		}
+		if s.lastDataType == "response.output_item.done" {
+			s.observeOutputItemDone(payload)
+		}
 		if isImagesResponsesErrorEventType(s.lastDataType) {
 			s.sawErrorEvent = true
 		}
@@ -135,10 +143,26 @@ func (s *imagesResponsesStreamStats) observeCompletedPayload(payload []byte) {
 	if !output.IsArray() {
 		return
 	}
+	s.completedOutputCount = len(output.Array())
 	for _, item := range output.Array() {
 		if item.Get("type").String() == "image_generation_call" && strings.TrimSpace(item.Get("result").String()) != "" {
 			s.imageCount++
 		}
+	}
+}
+
+func (s *imagesResponsesStreamStats) observeOutputItemDone(payload []byte) {
+	if s == nil || !json.Valid(payload) {
+		return
+	}
+	item := gjson.GetBytes(payload, "item")
+	if item.Get("type").String() != "image_generation_call" {
+		return
+	}
+	s.outputItemDoneCount++
+	if strings.TrimSpace(item.Get("result").String()) != "" {
+		s.outputItemResultCount++
+		s.imageCount++
 	}
 }
 
@@ -182,6 +206,10 @@ func (s *imagesResponsesStreamStats) err(classification string, statusCode int, 
 	dataCount := 0
 	imageCount := 0
 	partialImageCount := 0
+	completedOutputCount := 0
+	outputItemDoneCount := 0
+	outputItemResultCount := 0
+	syntheticCompletedUsed := false
 	if s != nil {
 		sawFirstEvent = s.sawFirstEvent
 		sawResponseCompleted = s.sawResponseCompleted
@@ -196,9 +224,13 @@ func (s *imagesResponsesStreamStats) err(classification string, statusCode int, 
 		dataCount = s.dataCount
 		imageCount = s.imageCount
 		partialImageCount = s.partialImageCount
+		completedOutputCount = s.completedOutputCount
+		outputItemDoneCount = s.outputItemDoneCount
+		outputItemResultCount = s.outputItemResultCount
+		syntheticCompletedUsed = s.syntheticCompletedUsed
 	}
 	message := fmt.Sprintf(
-		"images responses stream aggregation failed: classification=%s started_at=%q saw_first_event=%t saw_response_completed=%t saw_error_event=%t last_event_type=%q last_data_type=%q event_count=%d data_count=%d image_count=%d partial_image_count=%d finish_reason=%q scanner_error_type=%q stream_end_reason=%q chunk_count=%d elapsed_ms=%d",
+		"images responses stream aggregation failed: classification=%s started_at=%q saw_first_event=%t saw_response_completed=%t saw_error_event=%t last_event_type=%q last_data_type=%q event_count=%d data_count=%d image_count=%d partial_image_count=%d completed_seen=%t completed_output_count=%d output_item_done_count=%d output_item_result_count=%d synthetic_completed_used=%t finish_reason=%q scanner_error_type=%q stream_end_reason=%q chunk_count=%d elapsed_ms=%d",
 		classification,
 		startedAt,
 		sawFirstEvent,
@@ -210,6 +242,11 @@ func (s *imagesResponsesStreamStats) err(classification string, statusCode int, 
 		dataCount,
 		imageCount,
 		partialImageCount,
+		sawResponseCompleted,
+		completedOutputCount,
+		outputItemDoneCount,
+		outputItemResultCount,
+		syntheticCompletedUsed,
 		finishReason,
 		scannerErrorType,
 		streamEndReason,
@@ -286,7 +323,7 @@ func classifyImagesResponsesStreamError(err error) string {
 }
 
 func imagesResponsesStreamStatusCode(classification string, upstreamStatus int) int {
-	if upstreamStatus >= http.StatusBadRequest && upstreamStatus <= 599 {
+	if upstreamStatus >= http.StatusBadRequest && upstreamStatus < http.StatusInternalServerError {
 		return upstreamStatus
 	}
 	switch classification {
@@ -295,7 +332,7 @@ func imagesResponsesStreamStatusCode(classification string, upstreamStatus int) 
 	case "context_canceled":
 		return http.StatusRequestTimeout
 	case "missing_response_completed", "upstream_stream_closed", "scanner_error", "upstream_error_event":
-		return http.StatusBadGateway
+		return http.StatusServiceUnavailable
 	case "h2_stream_reset":
 		return http.StatusBadGateway
 	default:
@@ -476,6 +513,107 @@ func (a *sseFrameAccumulator) Flush() [][]byte {
 	}
 	a.pending = nil
 	return frames
+}
+
+func collectImagesOutputItemDone(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
+	item := gjson.GetBytes(eventData, "item")
+	if !item.Exists() || item.Type != gjson.JSON {
+		return
+	}
+	outputIndex := gjson.GetBytes(eventData, "output_index")
+	if outputIndex.Exists() {
+		outputItemsByIndex[outputIndex.Int()] = []byte(item.Raw)
+		return
+	}
+	*outputItemsFallback = append(*outputItemsFallback, []byte(item.Raw))
+}
+
+func completedImagesFromOutputItems(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	if !imageOutputItemsHaveResult(outputItemsByIndex, outputItemsFallback) {
+		return nil
+	}
+	eventData := []byte(`{"type":"response.completed","response":{"created_at":0,"output":[]}}`)
+	eventData, _ = sjson.SetBytes(eventData, "response.created_at", time.Now().Unix())
+	return patchImagesCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+}
+
+func patchImagesCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	output := gjson.GetBytes(eventData, "response.output")
+	if output.Exists() && output.IsArray() && len(output.Array()) > 0 {
+		return eventData
+	}
+	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
+		return eventData
+	}
+
+	indexes := make([]int64, 0, len(outputItemsByIndex))
+	for idx := range outputItemsByIndex {
+		indexes = append(indexes, idx)
+	}
+	sort.Slice(indexes, func(i, j int) bool {
+		return indexes[i] < indexes[j]
+	})
+
+	items := make([][]byte, 0, len(outputItemsByIndex)+len(outputItemsFallback))
+	for _, idx := range indexes {
+		items = append(items, outputItemsByIndex[idx])
+	}
+	items = append(items, outputItemsFallback...)
+
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, item := range items {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.Write(item)
+	}
+	buf.WriteByte(']')
+	patched, _ := sjson.SetRawBytes(eventData, "response.output", buf.Bytes())
+	return patched
+}
+
+func imageOutputItemsHaveResult(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) bool {
+	for _, item := range outputItemsByIndex {
+		if imageOutputItemHasResult(item) {
+			return true
+		}
+	}
+	for _, item := range outputItemsFallback {
+		if imageOutputItemHasResult(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func imageOutputItemHasResult(item []byte) bool {
+	if len(item) == 0 || !json.Valid(item) {
+		return false
+	}
+	return gjson.GetBytes(item, "type").String() == "image_generation_call" && strings.TrimSpace(gjson.GetBytes(item, "result").String()) != ""
+}
+
+func imageCompletedOutputCount(payload []byte) int {
+	output := gjson.GetBytes(payload, "response.output")
+	if !output.IsArray() {
+		return 0
+	}
+	return len(output.Array())
+}
+
+func imageCompletedResultCount(payload []byte) int {
+	output := gjson.GetBytes(payload, "response.output")
+	if !output.IsArray() {
+		return 0
+	}
+	count := 0
+	for _, item := range output.Array() {
+		if item.Get("type").String() == "image_generation_call" && strings.TrimSpace(item.Get("result").String()) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 func imagesModelParts(model string) (prefix string, baseModel string) {
@@ -1572,7 +1710,7 @@ func collectCompletedImageFrames(ctx context.Context, data <-chan []byte, errs <
 				}
 			}
 			if img.Result == "" {
-				return &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("upstream did not return image output")}
+				return &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("upstream did not return image output")}
 			}
 			if usage := gjson.GetBytes(payload, "usage"); usage.Exists() && usage.IsObject() {
 				usageRaw = []byte(usage.Raw)
@@ -1599,7 +1737,7 @@ func collectCompletedImageFrames(ctx context.Context, data <-chan []byte, errs <
 					}
 				}
 				if len(results) == 0 {
-					return nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("stream disconnected before completion")}
+					return nil, &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("stream disconnected before completion")}
 				}
 				firstMeta := results[0]
 				out, err := buildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
@@ -2018,6 +2156,30 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, errs <-chan *interfaces.ErrorMessage, responseFormat string) ([]byte, *interfaces.ErrorMessage) {
 	acc := &sseFrameAccumulator{}
 	stats := newImagesResponsesStreamStats()
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
+
+	buildFromOutputItems := func() ([]byte, *interfaces.ErrorMessage, bool) {
+		completed := completedImagesFromOutputItems(outputItemsByIndex, outputItemsFallback)
+		if len(completed) == 0 {
+			return nil, nil, false
+		}
+		stats.syntheticCompletedUsed = true
+		stats.completedOutputCount = imageCompletedOutputCount(completed)
+		results, createdAt, usageRaw, firstMeta, err := extractImagesFromResponsesCompleted(completed)
+		if err != nil {
+			return nil, stats.err("response_completed_extract_failed", http.StatusBadGateway, err), true
+		}
+		if len(results) == 0 {
+			return nil, nil, false
+		}
+		stats.imageCount = len(results)
+		out, err := buildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
+		if err != nil {
+			return nil, stats.err("image_response_build_failed", http.StatusInternalServerError, err), true
+		}
+		return out, nil, true
+	}
 
 	processFrame := func(frame []byte) ([]byte, bool, *interfaces.ErrorMessage) {
 		for _, line := range bytes.Split(frame, []byte("\n")) {
@@ -2036,7 +2198,7 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			stats.observeDataPayload(payload)
 			if isImagesResponsesErrorEventType(stats.lastEventType) {
 				stats.markStreamEnd("upstream_error_event")
-				return nil, false, stats.err("upstream_error_event", http.StatusBadGateway, nil)
+				return nil, false, stats.err("upstream_error_event", imagesResponsesStreamStatusCode("upstream_error_event", 0), nil)
 			}
 			if !json.Valid(payload) {
 				stats.markStreamEnd("invalid_sse_data_json")
@@ -2045,13 +2207,19 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 
 			if isImagesResponsesErrorEventType(stats.lastDataType) {
 				stats.markStreamEnd("upstream_error_event")
-				return nil, false, stats.err("upstream_error_event", http.StatusBadGateway, nil)
+				return nil, false, stats.err("upstream_error_event", imagesResponsesStreamStatusCode("upstream_error_event", 0), nil)
 			}
 
-			if gjson.GetBytes(payload, "type").String() != "response.completed" {
+			dataType := gjson.GetBytes(payload, "type").String()
+			if dataType == "response.output_item.done" {
+				collectImagesOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
+				continue
+			}
+			if dataType != "response.completed" {
 				continue
 			}
 
+			payload = patchImagesCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 			results, createdAt, usageRaw, firstMeta, err := extractImagesFromResponsesCompleted(payload)
 			if err != nil {
 				return nil, false, stats.err("response_completed_extract_failed", http.StatusBadGateway, err)
@@ -2083,6 +2251,9 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			return nil, stats.err(classification, imagesResponsesStreamStatusCode(classification, 0), ctx.Err())
 		case errMsg, ok := <-errs:
 			if ok && errMsg != nil {
+				if out, syntheticErr, ok := buildFromOutputItems(); ok {
+					return out, syntheticErr
+				}
 				if errMsg.Error != nil {
 					classification := classifyImagesResponsesStreamError(errMsg.Error)
 					stats.markScannerError(errMsg.Error)
@@ -2103,6 +2274,9 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 					} else if done {
 						return out, nil
 					}
+				}
+				if out, syntheticErr, ok := buildFromOutputItems(); ok {
+					return out, syntheticErr
 				}
 				stats.markStreamEnd("data_channel_closed")
 				return nil, stats.err("missing_response_completed", imagesResponsesStreamStatusCode("missing_response_completed", 0), fmt.Errorf("upstream_stream_closed"))
@@ -2250,6 +2424,9 @@ func imageGenerationStatuses(payload []byte) []string {
 func logImageCompletedWithoutOutput(ctx context.Context, payload []byte, reason string) {
 	log.WithContext(ctx).WithFields(log.Fields{
 		"reason":                    reason,
+		"completed_seen":            gjson.GetBytes(payload, "type").String() == "response.completed",
+		"completed_output_count":    imageCompletedOutputCount(payload),
+		"output_item_result_count":  imageCompletedResultCount(payload),
 		"response_status":           strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()),
 		"response_error":            strings.TrimSpace(gjson.GetBytes(payload, "response.error").Raw),
 		"response_incomplete":       strings.TrimSpace(gjson.GetBytes(payload, "response.incomplete_details").Raw),
@@ -2411,6 +2588,8 @@ func imageActionFromStreamPrefix(streamPrefix string) string {
 
 func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, firstChunk []byte, responseFormat string, streamPrefix string, writeEvent func(string, []byte)) {
 	acc := &sseFrameAccumulator{}
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
 
 	responseFormat = strings.ToLower(strings.TrimSpace(responseFormat))
 	if responseFormat == "" {
@@ -2427,6 +2606,35 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 		writeImagesStreamErrorEvent(c, errMsg)
 		flusher.Flush()
 	}
+	emitCompletedResults := func(results []imageCallResult, usageRaw []byte) {
+		eventName := streamPrefix + ".completed"
+		for _, img := range results {
+			data := []byte(`{"type":""}`)
+			data, _ = sjson.SetBytes(data, "type", eventName)
+			if responseFormat == "url" {
+				mt := mimeTypeFromOutputFormat(img.OutputFormat)
+				data, _ = sjson.SetBytes(data, "url", "data:"+mt+";base64,"+img.Result)
+			} else {
+				data, _ = sjson.SetBytes(data, "b64_json", img.Result)
+			}
+			if len(usageRaw) > 0 && json.Valid(usageRaw) {
+				data, _ = sjson.SetRawBytes(data, "usage", usageRaw)
+			}
+			writeEvent(eventName, data)
+		}
+	}
+	emitSyntheticCompleted := func() bool {
+		completed := completedImagesFromOutputItems(outputItemsByIndex, outputItemsFallback)
+		if len(completed) == 0 {
+			return false
+		}
+		results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(completed)
+		if err != nil || len(results) == 0 {
+			return false
+		}
+		emitCompletedResults(results, usageRaw)
+		return true
+	}
 
 	processFrame := func(frame []byte) (done bool) {
 		for _, line := range bytes.Split(frame, []byte("\n")) {
@@ -2440,6 +2648,8 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			}
 
 			switch gjson.GetBytes(payload, "type").String() {
+			case "response.output_item.done":
+				collectImagesOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 			case "response.image_generation_call.partial_image":
 				b64 := strings.TrimSpace(gjson.GetBytes(payload, "partial_image_b64").String())
 				if b64 == "" {
@@ -2459,6 +2669,7 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 				}
 				writeEvent(eventName, data)
 			case "response.completed":
+				payload = patchImagesCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 				results, _, usageRaw, _, err := extractImagesFromResponsesCompleted(payload)
 				if err != nil {
 					emitError(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
@@ -2467,24 +2678,10 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 				if len(results) == 0 {
 					reason := imageCompletedWithoutOutputReason(payload)
 					logImageCompletedWithoutOutput(ctx, payload, reason)
-					emitError(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("upstream completed without image output: %s", reason)})
+					emitError(&interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("upstream completed without image output: %s", reason)})
 					return true
 				}
-				eventName := streamPrefix + ".completed"
-				for _, img := range results {
-					data := []byte(`{"type":""}`)
-					data, _ = sjson.SetBytes(data, "type", eventName)
-					if responseFormat == "url" {
-						mt := mimeTypeFromOutputFormat(img.OutputFormat)
-						data, _ = sjson.SetBytes(data, "url", "data:"+mt+";base64,"+img.Result)
-					} else {
-						data, _ = sjson.SetBytes(data, "b64_json", img.Result)
-					}
-					if len(usageRaw) > 0 && json.Valid(usageRaw) {
-						data, _ = sjson.SetRawBytes(data, "usage", usageRaw)
-					}
-					writeEvent(eventName, data)
-				}
+				emitCompletedResults(results, usageRaw)
 				return true
 			}
 		}
@@ -2505,6 +2702,10 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			return
 		case errMsg, ok := <-errs:
 			if ok && errMsg != nil {
+				if emitSyntheticCompleted() {
+					cancel(nil)
+					return
+				}
 				emitError(errMsg)
 				cancel(errMsg.Error)
 				return
@@ -2517,6 +2718,10 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 						cancel(nil)
 						return
 					}
+				}
+				if emitSyntheticCompleted() {
+					cancel(nil)
+					return
 				}
 				cancel(nil)
 				return

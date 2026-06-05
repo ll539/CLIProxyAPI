@@ -106,6 +106,36 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	return completedDataPatched
 }
 
+func codexCompletedFromOutputItems(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	if !codexOutputItemsHaveImageResult(outputItemsByIndex, outputItemsFallback) {
+		return nil
+	}
+	eventData := []byte(`{"type":"response.completed","response":{"created_at":0,"output":[]}}`)
+	eventData, _ = sjson.SetBytes(eventData, "response.created_at", time.Now().Unix())
+	return patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+}
+
+func codexOutputItemsHaveImageResult(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) bool {
+	for _, item := range outputItemsByIndex {
+		if codexOutputItemHasImageResult(item) {
+			return true
+		}
+	}
+	for _, item := range outputItemsFallback {
+		if codexOutputItemHasImageResult(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexOutputItemHasImageResult(item []byte) bool {
+	if len(item) == 0 || !gjson.ValidBytes(item) {
+		return false
+	}
+	return gjson.GetBytes(item, "type").String() == "image_generation_call" && strings.TrimSpace(gjson.GetBytes(item, "result").String()) != ""
+}
+
 func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
 	streamErr, body, ok := codexTerminalStreamErr(eventData)
 	if !ok || !codexTerminalErrorIsContextLength(body) {

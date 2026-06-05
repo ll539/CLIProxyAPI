@@ -462,6 +462,49 @@ data: {"type":"response.completed","response":{"created_at":123,"output":[{"type
 	}
 }
 
+func TestCollectImagesFromResponsesStreamSynthesizesCompletedFromOutputItemDone(t *testing.T) {
+	data := make(chan []byte, 1)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte(`event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"image-data","output_format":"png","revised_prompt":"refined"}}
+
+`)
+	close(data)
+	close(errs)
+
+	out, errMsg := collectImagesFromResponsesStream(context.Background(), data, errs, "b64_json")
+
+	if errMsg != nil {
+		t.Fatalf("collectImagesFromResponsesStream() error = %v", errMsg.Error)
+	}
+	if got := gjson.GetBytes(out, "data.0.b64_json").String(); got != "image-data" {
+		t.Fatalf("data.0.b64_json = %q, want image-data", got)
+	}
+	if got := gjson.GetBytes(out, "data.0.revised_prompt").String(); got != "refined" {
+		t.Fatalf("data.0.revised_prompt = %q, want refined", got)
+	}
+}
+
+func TestCollectImagesFromResponsesStreamPartialOnlyIsNotFinalImage(t *testing.T) {
+	data := make(chan []byte, 1)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte(`event: response.image_generation_call.partial_image
+data: {"type":"response.image_generation_call.partial_image","partial_image_index":0,"partial_image_b64":"image-data"}
+
+`)
+	close(data)
+	close(errs)
+
+	out, errMsg := collectImagesFromResponsesStream(context.Background(), data, errs, "b64_json")
+
+	if out != nil {
+		t.Fatalf("out = %s, want nil", string(out))
+	}
+	requireImagesStreamError(t, errMsg, http.StatusServiceUnavailable, "classification=missing_response_completed")
+	requireImagesStreamErrorContains(t, errMsg, "partial_image_count=1")
+	requireImagesStreamErrorContains(t, errMsg, "output_item_result_count=0")
+}
+
 func TestCollectRoutedImagesRetriesBeforeFirstImageFrame(t *testing.T) {
 	executor := &imageBootstrapRetryExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -556,7 +599,7 @@ data: {"type":"response.created","response":{"id":"resp-1"}}
 	if out != nil {
 		t.Fatalf("out = %s, want nil", string(out))
 	}
-	requireImagesStreamError(t, errMsg, http.StatusBadGateway, "classification=missing_response_completed")
+	requireImagesStreamError(t, errMsg, http.StatusServiceUnavailable, "classification=missing_response_completed")
 	requireImagesStreamErrorContains(t, errMsg, "saw_response_completed=false")
 	requireImagesStreamErrorContains(t, errMsg, "saw_first_event=true")
 	requireImagesStreamErrorContains(t, errMsg, `last_event_type="response.created"`)
@@ -579,7 +622,7 @@ func TestCollectImagesFromResponsesStreamUpstreamClosedWithoutPayload(t *testing
 	if out != nil {
 		t.Fatalf("out = %s, want nil", string(out))
 	}
-	requireImagesStreamError(t, errMsg, http.StatusBadGateway, "classification=upstream_stream_closed")
+	requireImagesStreamError(t, errMsg, http.StatusServiceUnavailable, "classification=upstream_stream_closed")
 	requireImagesStreamErrorContains(t, errMsg, `stream_end_reason="upstream_stream_closed"`)
 	requireImagesStreamErrorContains(t, errMsg, "saw_response_completed=false")
 }
@@ -659,22 +702,22 @@ func TestImagesResponsesStreamStatusCode(t *testing.T) {
 			want:           http.StatusTooManyRequests,
 		},
 		{
-			name:           "preserves upstream server error",
+			name:           "server upstream stream closed becomes service unavailable",
 			classification: "upstream_stream_closed",
 			upstreamStatus: http.StatusInternalServerError,
-			want:           http.StatusInternalServerError,
+			want:           http.StatusServiceUnavailable,
 		},
 		{
 			name:           "scanner fallback without upstream status",
 			classification: "scanner_error",
 			upstreamStatus: 0,
-			want:           http.StatusBadGateway,
+			want:           http.StatusServiceUnavailable,
 		},
 		{
 			name:           "scanner ignores upstream success status",
 			classification: "scanner_error",
 			upstreamStatus: http.StatusOK,
-			want:           http.StatusBadGateway,
+			want:           http.StatusServiceUnavailable,
 		},
 		{
 			name:           "timeout fallback without upstream status",
@@ -729,7 +772,7 @@ func TestCollectImagesFromResponsesStreamScannerError(t *testing.T) {
 	if out != nil {
 		t.Fatalf("out = %s, want nil", string(out))
 	}
-	requireImagesStreamError(t, errMsg, http.StatusInternalServerError, "classification=scanner_error")
+	requireImagesStreamError(t, errMsg, http.StatusServiceUnavailable, "classification=scanner_error")
 	requireImagesStreamErrorContains(t, errMsg, "cause=scanner_error")
 	requireImagesStreamErrorContains(t, errMsg, `scanner_error_type="scanner_error"`)
 	requireImagesStreamErrorContains(t, errMsg, `stream_end_reason="scanner_error"`)
@@ -782,7 +825,7 @@ func TestCollectImagesFromResponsesStreamHTTP2Reset(t *testing.T) {
 	if out != nil {
 		t.Fatalf("out = %s, want nil", string(out))
 	}
-	requireImagesStreamError(t, errMsg, http.StatusInternalServerError, "classification=h2_stream_reset")
+	requireImagesStreamError(t, errMsg, http.StatusBadGateway, "classification=h2_stream_reset")
 	requireImagesStreamErrorContains(t, errMsg, "cause=http2_stream_reset")
 	requireImagesStreamErrorContains(t, errMsg, `scanner_error_type="http2_stream_reset"`)
 	requireImagesStreamErrorContains(t, errMsg, `stream_end_reason="h2_stream_reset"`)
@@ -823,7 +866,7 @@ data: {"type":"error","message":"safe upstream error"}
 	if out != nil {
 		t.Fatalf("out = %s, want nil", string(out))
 	}
-	requireImagesStreamError(t, errMsg, http.StatusBadGateway, "classification=upstream_error_event")
+	requireImagesStreamError(t, errMsg, http.StatusServiceUnavailable, "classification=upstream_error_event")
 	requireImagesStreamErrorContains(t, errMsg, "saw_error_event=true")
 	requireImagesStreamErrorContains(t, errMsg, `last_event_type="error"`)
 	requireImagesStreamErrorContains(t, errMsg, `last_data_type="error"`)

@@ -774,6 +774,20 @@ func (e *streamBootstrapError) Headers() http.Header {
 	return cloneHTTPHeader(e.headers)
 }
 
+func (e *streamBootstrapError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return statusCodeFromError(e.cause)
+}
+
+func (e *streamBootstrapError) RetryAfter() *time.Duration {
+	if e == nil {
+		return nil
+	}
+	return retryAfterFromError(e.cause)
+}
+
 func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamResult {
 	ch := make(chan cliproxyexecutor.StreamChunk, 1)
 	ch <- cliproxyexecutor.StreamChunk{Err: err}
@@ -935,7 +949,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 
 		if closed && len(buffered) == 0 {
-			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {

@@ -82,6 +82,31 @@ func TestCodexOpenAIImageExecutePreservesCompletedResponseShape(t *testing.T) {
 	}
 }
 
+func TestCodexOpenAIImageSSESynthesizesCompletedFromOutputItemDone(t *testing.T) {
+	data, err := codexReadOpenAIImageResponsesSSE(context.Background(), strings.NewReader(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"AA==","output_format":"png"}}
+
+`), map[int64][]byte{}, &[][]byte{})
+	if err != nil {
+		t.Fatalf("codexReadOpenAIImageResponsesSSE() error = %v", err)
+	}
+	if got := gjson.GetBytes(data, "type").String(); got != "response.completed" {
+		t.Fatalf("type = %q, want response.completed; data=%s", got, string(data))
+	}
+	if got := gjson.GetBytes(data, "response.output.0.result").String(); got != "AA==" {
+		t.Fatalf("result = %q, want AA==; data=%s", got, string(data))
+	}
+}
+
+func TestCodexOpenAIImageSSEPartialOnlyIsNotFinalImage(t *testing.T) {
+	_, err := codexReadOpenAIImageResponsesSSE(context.Background(), strings.NewReader(`data: {"type":"response.image_generation_call.partial_image","partial_image_index":0,"partial_image_b64":"AA=="}
+
+`), map[int64][]byte{}, &[][]byte{})
+	assertCodexImageStreamStatus(t, err, http.StatusServiceUnavailable, codexImageSSEMissingCompleted)
+	msg := err.Error()
+	assertCodexImageErrContains(t, msg, "partial_image_count=1")
+	assertCodexImageErrContains(t, msg, "output_item_result_count=0")
+}
+
 func TestCodexBuildImagesResponsesRequestIncludesImageGenerationToolWhenForced(t *testing.T) {
 	out := codexBuildImagesResponsesRequest("draw a cat", nil, nil)
 
@@ -118,12 +143,12 @@ func TestCodexEnsureImagesResponsesImageGenerationToolRepairsMissingTools(t *tes
 	}
 }
 
-func TestCodexOpenAIImageSSEMissingCompletedReturns502(t *testing.T) {
-	_, err := codexReadOpenAIImageResponsesSSE(context.Background(), strings.NewReader(`data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"AA=="}}
+func TestCodexOpenAIImageSSEMissingCompletedReturns503(t *testing.T) {
+	_, err := codexReadOpenAIImageResponsesSSE(context.Background(), strings.NewReader(`data: {"type":"response.created","response":{"id":"resp_1"}}
 
 `), map[int64][]byte{}, &[][]byte{})
 
-	assertCodexImageStreamStatus(t, err, http.StatusBadGateway, codexImageSSEMissingCompleted)
+	assertCodexImageStreamStatus(t, err, http.StatusServiceUnavailable, codexImageSSEMissingCompleted)
 	if strings.Contains(err.Error(), "stream error: stream disconnected before completion") {
 		t.Fatalf("error used old 504 message: %v", err)
 	}
@@ -131,12 +156,12 @@ func TestCodexOpenAIImageSSEMissingCompletedReturns502(t *testing.T) {
 
 func TestCodexOpenAIImageSSEClassifiesUnexpectedEOF(t *testing.T) {
 	_, err := codexReadOpenAIImageResponsesSSE(context.Background(), codexImageErrReader{err: io.ErrUnexpectedEOF}, map[int64][]byte{}, &[][]byte{})
-	assertCodexImageStreamStatus(t, err, http.StatusBadGateway, codexImageSSEStreamClosed)
+	assertCodexImageStreamStatus(t, err, http.StatusServiceUnavailable, codexImageSSEStreamClosed)
 }
 
 func TestCodexOpenAIImageSSEClassifiesReadError(t *testing.T) {
 	_, err := codexReadOpenAIImageResponsesSSE(context.Background(), codexImageErrReader{err: errors.New("read failed")}, map[int64][]byte{}, &[][]byte{})
-	assertCodexImageStreamStatus(t, err, http.StatusBadGateway, codexImageSSEReadError)
+	assertCodexImageStreamStatus(t, err, http.StatusServiceUnavailable, codexImageSSEReadError)
 }
 
 func TestCodexOpenAIImageSSEClassifiesHTTP2Reset(t *testing.T) {
