@@ -28,7 +28,6 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
-	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -72,6 +71,8 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+
+	cfg.NormalizePluginsConfig()
 
 	// Apply the same sanitization pipeline.
 	cfg.SanitizeGeminiKeys()

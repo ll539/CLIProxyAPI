@@ -12,6 +12,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -165,12 +166,12 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	for idx, item := range outputItemsFallback {
 		outputItemsFallback[idx] = applyCodexIdentityConfuseResponsePayload(item, identityState)
 	}
-	completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
-	results, createdAt, usageRaw, firstMeta, errExtract := codexExtractImagesFromResponsesCompleted(completedData)
+	results, createdAt, usageRaw, firstMeta, errExtract := codexExtractImageResults(eventData, outputItemsByIndex, outputItemsFallback)
 	if errExtract != nil {
 		return resp, errExtract
 	}
 	if len(results) == 0 {
+		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 		reason := codexImageCompletedWithoutOutputReason(completedData)
 		logCodexImageCompletedWithoutOutput(ctx, completedData, reason)
 		return resp, statusErr{code: http.StatusServiceUnavailable, msg: "upstream completed without image output: " + reason}
@@ -981,12 +982,12 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
-		emitCompletedData := func(completedData []byte) bool {
+		emitCompletedData := func(completedData []byte, itemsByIndex map[int64][]byte, fallback [][]byte) bool {
 			if detail, ok := helps.ParseCodexUsage(completedData); ok {
 				reporter.Publish(ctx, detail)
 			}
 			publishCodexImageToolUsage(ctx, reporter, body, completedData)
-			results, _, usageRaw, _, errExtract := codexExtractImagesFromResponsesCompleted(completedData)
+			results, _, usageRaw, _, errExtract := codexExtractImageResults(completedData, itemsByIndex, fallback)
 			if errExtract != nil {
 				sendError(errExtract)
 				return true
@@ -1007,7 +1008,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			if len(completedData) == 0 {
 				return false
 			}
-			return emitCompletedData(completedData)
+			return emitCompletedData(completedData, nil, nil)
 		}
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
@@ -1025,10 +1026,10 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 					return
 				}
 			case "response.completed":
-				completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
-				if emitCompletedData(completedData) {
+				if emitCompletedData(eventData, outputItemsByIndex, outputItemsFallback) {
 					return
 				}
+				completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 				reason := codexImageCompletedWithoutOutputReason(completedData)
 				logCodexImageCompletedWithoutOutput(ctx, completedData, reason)
 				sendError(statusErr{code: http.StatusServiceUnavailable, msg: "upstream completed without image output: " + reason})
@@ -1047,7 +1048,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		if !emitSyntheticCompleted() && len(outputItemsByIndex)+len(outputItemsFallback) > 0 {
 			completedData := patchCodexCompletedOutput([]byte(`{"type":"response.completed","response":{"output":[]}}`), outputItemsByIndex, outputItemsFallback)
 			if len(completedData) > 0 {
-				results, _, _, _, _ := codexExtractImagesFromResponsesCompleted(completedData)
+				results, _, _, _, _ := codexExtractImageResults(completedData, nil, nil)
 				if len(results) == 0 {
 					reason := codexImageCompletedWithoutOutputReason(completedData)
 					logCodexImageCompletedWithoutOutput(ctx, completedData, reason)
@@ -1392,39 +1393,76 @@ func codexMultipartFileToDataURL(fileHeader *multipart.FileHeader) (string, erro
 	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
 }
 
-func codexExtractImagesFromResponsesCompleted(payload []byte) (results []codexImageCallResult, createdAt int64, usageRaw []byte, firstMeta codexImageCallResult, err error) {
-	if gjson.GetBytes(payload, "type").String() != "response.completed" {
+// codexExtractImageResults extracts image generation results directly from the
+// completed event and the items collected from response.output_item.done events,
+// without rebuilding the full completed JSON.
+//
+// It prefers image_generation_call items already present in the completed event's
+// response.output and only falls back to the collected items when that output is
+// empty, mirroring the semantics of patchCodexCompletedOutput + the previous
+// extractor. Skipping the concatenate-and-reparse step avoids two large copies of
+// the base64 payload, which matters for multi-megabyte generated images.
+func codexExtractImageResults(completed []byte, itemsByIndex map[int64][]byte, fallback [][]byte) (results []codexImageCallResult, createdAt int64, usageRaw []byte, firstMeta codexImageCallResult, err error) {
+	if gjson.GetBytes(completed, "type").String() != "response.completed" {
 		return nil, 0, nil, codexImageCallResult{}, fmt.Errorf("unexpected event type")
 	}
-	createdAt = gjson.GetBytes(payload, "response.created_at").Int()
+	createdAt = gjson.GetBytes(completed, "response.created_at").Int()
 	if createdAt <= 0 {
 		createdAt = time.Now().Unix()
 	}
-	output := gjson.GetBytes(payload, "response.output")
-	if output.IsArray() {
-		for _, item := range output.Array() {
-			if item.Get("type").String() != "image_generation_call" {
-				continue
+
+	appendItem := func(item gjson.Result) {
+		if item.Get("type").String() != "image_generation_call" {
+			return
+		}
+		res := strings.TrimSpace(item.Get("result").String())
+		if res == "" {
+			return
+		}
+		entry := codexImageCallResult{
+			Result:        res,
+			RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
+			OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
+			Size:          strings.TrimSpace(item.Get("size").String()),
+			Background:    strings.TrimSpace(item.Get("background").String()),
+			Quality:       strings.TrimSpace(item.Get("quality").String()),
+		}
+		if len(results) == 0 {
+			firstMeta = entry
+		}
+		results = append(results, entry)
+	}
+
+	var outputItems []gjson.Result
+	if output := gjson.GetBytes(completed, "response.output"); output.Exists() && output.IsArray() {
+		outputItems = output.Array()
+	}
+	if len(outputItems) > 0 {
+		// Completed event already carries the output; extract from it in place.
+		results = make([]codexImageCallResult, 0, len(outputItems))
+		for _, item := range outputItems {
+			appendItem(item)
+		}
+	} else if len(itemsByIndex) > 0 || len(fallback) > 0 {
+		// Completed output was empty; extract directly from the collected items,
+		// preserving their original output_index ordering.
+		results = make([]codexImageCallResult, 0, len(itemsByIndex)+len(fallback))
+		if len(itemsByIndex) > 0 {
+			indexes := make([]int64, 0, len(itemsByIndex))
+			for idx := range itemsByIndex {
+				indexes = append(indexes, idx)
 			}
-			res := strings.TrimSpace(item.Get("result").String())
-			if res == "" {
-				continue
+			sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
+			for _, idx := range indexes {
+				appendItem(gjson.ParseBytes(itemsByIndex[idx]))
 			}
-			entry := codexImageCallResult{
-				Result:        res,
-				RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
-				OutputFormat:  strings.TrimSpace(item.Get("output_format").String()),
-				Size:          strings.TrimSpace(item.Get("size").String()),
-				Background:    strings.TrimSpace(item.Get("background").String()),
-				Quality:       strings.TrimSpace(item.Get("quality").String()),
-			}
-			if len(results) == 0 {
-				firstMeta = entry
-			}
-			results = append(results, entry)
+		}
+		for _, raw := range fallback {
+			appendItem(gjson.ParseBytes(raw))
 		}
 	}
-	if usage := gjson.GetBytes(payload, "response.tool_usage.image_gen"); usage.Exists() && usage.IsObject() {
+
+	if usage := gjson.GetBytes(completed, "response.tool_usage.image_gen"); usage.Exists() && usage.IsObject() {
 		usageRaw = []byte(usage.Raw)
 	}
 	return results, createdAt, usageRaw, firstMeta, nil
