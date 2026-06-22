@@ -1094,7 +1094,7 @@ func codexPrepareOpenAIImageDirectMultipart(rawBody []byte, routeModel string, e
 		}
 	}()
 
-	body, rewrittenContentType, errRewrite := codexRewriteOpenAIImageDirectMultipartPayload(form, codexOpenAIImageDirectModel(routeModel), stream)
+	body, errRewrite := codexBuildOpenAIImageDirectMultipartJSONPayload(form, codexOpenAIImageDirectModel(routeModel), stream)
 	if errRewrite != nil {
 		return codexOpenAIImagePreparedRequest{}, errRewrite
 	}
@@ -1103,7 +1103,7 @@ func codexPrepareOpenAIImageDirectMultipart(rawBody []byte, routeModel string, e
 		ResponseFormat: codexNormalizeImageResponseFormat(codexFormValue(form, "response_format")),
 		StreamPrefix:   streamPrefix,
 		EndpointPath:   endpointPath,
-		ContentType:    rewrittenContentType,
+		ContentType:    "application/json",
 	}, nil
 }
 
@@ -1186,6 +1186,71 @@ func codexRewriteOpenAIImageDirectMultipartPayload(form *multipart.Form, model s
 		return nil, "", fmt.Errorf("close multipart writer failed: %w", errClose)
 	}
 	return body.Bytes(), writer.FormDataContentType(), nil
+}
+
+func codexBuildOpenAIImageDirectMultipartJSONPayload(form *multipart.Form, model string, stream bool) ([]byte, error) {
+	if form == nil {
+		return nil, fmt.Errorf("multipart form is nil")
+	}
+	payload := make(map[string]any)
+	if strings.TrimSpace(model) != "" {
+		payload["model"] = strings.TrimSpace(model)
+	}
+	if stream {
+		payload["stream"] = true
+	}
+
+	for key, values := range form.Value {
+		if key == "model" || key == "stream" || len(values) == 0 {
+			continue
+		}
+		if len(values) == 1 {
+			payload[key] = codexMultipartJSONFieldValue(key, values[0])
+			continue
+		}
+		out := make([]any, 0, len(values))
+		for _, value := range values {
+			out = append(out, codexMultipartJSONFieldValue(key, value))
+		}
+		payload[key] = out
+	}
+
+	images := make([]map[string]string, 0)
+	for _, fh := range codexMultipartImageFiles(form) {
+		dataURL, errData := codexMultipartFileToDataURL(fh)
+		if errData != nil {
+			return nil, errData
+		}
+		images = append(images, map[string]string{"image_url": dataURL})
+	}
+	if len(images) > 0 {
+		payload["images"] = images
+	}
+
+	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+		dataURL, errData := codexMultipartFileToDataURL(maskFiles[0])
+		if errData != nil {
+			return nil, errData
+		}
+		payload["mask"] = map[string]string{"image_url": dataURL}
+	}
+
+	body, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("marshal image edit JSON failed: %w", errMarshal)
+	}
+	return body, nil
+}
+
+func codexMultipartJSONFieldValue(key string, value string) any {
+	value = strings.TrimSpace(value)
+	switch key {
+	case "n", "output_compression", "partial_images":
+		if parsed, errParse := strconv.ParseInt(value, 10, 64); errParse == nil {
+			return parsed
+		}
+	}
+	return value
 }
 
 func codexPrepareOpenAIImageRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (codexOpenAIImagePreparedRequest, error) {

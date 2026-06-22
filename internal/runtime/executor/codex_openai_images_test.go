@@ -179,10 +179,9 @@ func TestCodexOpenAIImageExecuteUsesDirectEditsJSON(t *testing.T) {
 	}
 }
 
-func TestCodexOpenAIImageExecuteUsesDirectEditsMultipart(t *testing.T) {
+func TestCodexOpenAIImageExecuteConvertsDirectEditsMultipartToJSON(t *testing.T) {
 	var gotPath, gotAccept, gotContentType string
-	var gotFields map[string][]string
-	var gotFiles map[string]string
+	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAccept = r.Header.Get("Accept")
@@ -191,35 +190,11 @@ func TestCodexOpenAIImageExecuteUsesDirectEditsMultipart(t *testing.T) {
 			http.Error(w, "unexpected path", http.StatusNotFound)
 			return
 		}
-		if errParse := r.ParseMultipartForm(32 << 20); errParse != nil {
-			http.Error(w, errParse.Error(), http.StatusBadRequest)
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			http.Error(w, errRead.Error(), http.StatusBadRequest)
 			return
-		}
-		defer func() {
-			if r.MultipartForm != nil {
-				_ = r.MultipartForm.RemoveAll()
-			}
-		}()
-		gotFields = r.MultipartForm.Value
-		gotFiles = map[string]string{}
-		for key, files := range r.MultipartForm.File {
-			if len(files) == 0 || files[0] == nil {
-				continue
-			}
-			f, errOpen := files[0].Open()
-			if errOpen != nil {
-				http.Error(w, errOpen.Error(), http.StatusBadRequest)
-				return
-			}
-			data, errRead := io.ReadAll(f)
-			if errClose := f.Close(); errClose != nil && errRead == nil {
-				errRead = errClose
-			}
-			if errRead != nil {
-				http.Error(w, errRead.Error(), http.StatusBadRequest)
-				return
-			}
-			gotFiles[key] = files[0].Header.Get("Content-Type") + ":" + string(data)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(codexDirectImageJSONResponse())
@@ -241,29 +216,32 @@ func TestCodexOpenAIImageExecuteUsesDirectEditsMultipart(t *testing.T) {
 	if gotAccept != "application/json" {
 		t.Fatalf("Accept = %q, want application/json", gotAccept)
 	}
-	if !strings.HasPrefix(gotContentType, "multipart/form-data; boundary=") {
-		t.Fatalf("Content-Type = %q, want multipart/form-data boundary", gotContentType)
+	if gotContentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", gotContentType)
 	}
-	if got := gotFields["model"]; len(got) != 1 || got[0] != "gpt-image-2" {
-		t.Fatalf("model fields = %#v, want gpt-image-2", got)
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-image-2" {
+		t.Fatalf("model = %q, want gpt-image-2; body=%s", got, string(gotBody))
 	}
-	if got := gotFields["prompt"]; len(got) != 1 || got[0] != "edit multipart" {
-		t.Fatalf("prompt fields = %#v, want edit multipart", got)
+	if got := gjson.GetBytes(gotBody, "prompt").String(); got != "edit multipart" {
+		t.Fatalf("prompt = %q, want edit multipart; body=%s", got, string(gotBody))
 	}
-	if got := gotFields["size"]; len(got) != 1 || got[0] != "2048x2048" {
-		t.Fatalf("size fields = %#v, want 2048x2048", got)
+	if got := gjson.GetBytes(gotBody, "size").String(); got != "2048x2048" {
+		t.Fatalf("size = %q, want 2048x2048; body=%s", got, string(gotBody))
 	}
-	if got := gotFields["quality"]; len(got) != 1 || got[0] != "high" {
-		t.Fatalf("quality fields = %#v, want high", got)
+	if got := gjson.GetBytes(gotBody, "quality").String(); got != "high" {
+		t.Fatalf("quality = %q, want high; body=%s", got, string(gotBody))
 	}
-	if got := gotFields["stream"]; len(got) != 0 {
-		t.Fatalf("stream fields = %#v, want absent", got)
+	if got := gjson.GetBytes(gotBody, "output_format").String(); got != "png" {
+		t.Fatalf("output_format = %q, want png; body=%s", got, string(gotBody))
 	}
-	if got := gotFiles["image"]; got != "image/png:image-bytes" {
-		t.Fatalf("image file = %q, want image/png:image-bytes", got)
+	if gjson.GetBytes(gotBody, "stream").Exists() {
+		t.Fatalf("stream should be absent for non-stream edits request: %s", string(gotBody))
 	}
-	if got := gotFiles["mask"]; got != "image/png:mask-bytes" {
-		t.Fatalf("mask file = %q, want image/png:mask-bytes", got)
+	if got := gjson.GetBytes(gotBody, "images.0.image_url").String(); got != "data:image/png;base64,aW1hZ2UtYnl0ZXM=" {
+		t.Fatalf("image = %q; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "mask.image_url").String(); got != "data:image/png;base64,bWFzay1ieXRlcw==" {
+		t.Fatalf("mask = %q; body=%s", got, string(gotBody))
 	}
 	if got := gjson.GetBytes(resp.Payload, "data.0.b64_json").String(); got != "AA==" {
 		t.Fatalf("b64_json = %q, want AA==; payload=%s", got, string(resp.Payload))
