@@ -1331,6 +1331,7 @@ func codexPrepareOpenAIImageDirectJSON(rawJSON []byte, routeModel string, endpoi
 	} else {
 		payload, _ = sjson.DeleteBytes(payload, "stream")
 	}
+	payload, _ = sjson.DeleteBytes(payload, "response_format")
 	return codexOpenAIImagePreparedRequest{
 		Body:           payload,
 		ResponseFormat: codexOpenAIImageResponseFormatFromJSON(rawJSON),
@@ -1397,7 +1398,7 @@ func codexBuildOpenAIImageDirectMultipartJSONPayload(form *multipart.Form, model
 	}
 
 	for key, values := range form.Value {
-		if key == "model" || key == "stream" || len(values) == 0 {
+		if key == "model" || key == "stream" || key == "response_format" || len(values) == 0 {
 			continue
 		}
 		if len(values) == 1 {

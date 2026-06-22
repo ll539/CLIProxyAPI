@@ -82,6 +82,9 @@ func TestCodexOpenAIImageExecuteUsesDirectGenerationsNonStream(t *testing.T) {
 	if gjson.GetBytes(gotBody, "stream").Exists() {
 		t.Fatalf("stream should be absent for non-stream direct request: %s", string(gotBody))
 	}
+	if gjson.GetBytes(gotBody, "response_format").Exists() {
+		t.Fatalf("response_format should not be sent to direct upstream: %s", string(gotBody))
+	}
 
 	if got := gjson.GetBytes(resp.Payload, "data.0.b64_json").String(); got != "AA==" {
 		t.Fatalf("b64_json = %q, want AA==; payload=%s", got, string(resp.Payload))
@@ -151,7 +154,7 @@ func TestCodexOpenAIImageExecuteUsesDirectEditsJSON(t *testing.T) {
 
 	req := cliproxyexecutor.Request{
 		Model:   "codex/gpt-image-2",
-		Payload: []byte(`{"model":"gpt-image-2","prompt":"edit","images":[{"image_url":"data:image/png;base64,AA=="}],"mask":{"image_url":"data:image/png;base64,BB=="},"size":"2048x2048","quality":"high","output_format":"png","stream":true}`),
+		Payload: []byte(`{"model":"gpt-image-2","prompt":"edit","images":[{"image_url":"data:image/png;base64,AA=="}],"mask":{"image_url":"data:image/png;base64,BB=="},"size":"2048x2048","quality":"high","output_format":"png","response_format":"b64_json","stream":true}`),
 	}
 	resp, err := codexTestImageExecutor(server.URL).Execute(context.Background(), codexTestImageAuth(server.URL), req, codexTestImageOptionsWithPath(codexImagesEditsPath))
 	if err != nil {
@@ -169,6 +172,9 @@ func TestCodexOpenAIImageExecuteUsesDirectEditsJSON(t *testing.T) {
 	}
 	if gjson.GetBytes(gotBody, "stream").Exists() {
 		t.Fatalf("stream should be absent for non-stream direct request: %s", string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "response_format").Exists() {
+		t.Fatalf("response_format should not be sent to direct upstream: %s", string(gotBody))
 	}
 	if got := gjson.GetBytes(gotBody, "prompt").String(); got != "edit" {
 		t.Fatalf("request prompt = %q, want edit; body=%s", got, string(gotBody))
@@ -254,11 +260,13 @@ func TestCodexOpenAIImageExecuteUsesDirectEditsMultipart(t *testing.T) {
 		{field: "size", want: "2048x2048"},
 		{field: "quality", want: "high"},
 		{field: "output_format", want: "png"},
-		{field: "response_format", want: "b64_json"},
 	} {
 		if got := gjson.GetBytes(gotBody, tt.field).String(); got != tt.want {
 			t.Fatalf("request %s = %q, want %q; body=%s", tt.field, got, tt.want, string(gotBody))
 		}
+	}
+	if gjson.GetBytes(gotBody, "response_format").Exists() {
+		t.Fatalf("response_format should not be sent to direct upstream: %s", string(gotBody))
 	}
 	if got := gjson.GetBytes(gotBody, "images.0.image_url").String(); got != "data:image/png;base64,aW1hZ2UtYnl0ZXM=" {
 		t.Fatalf("image = %q; body=%s", got, string(gotBody))
@@ -324,6 +332,9 @@ func TestCodexOpenAIImageExecuteConvertsDirectEditsMultipartImageArrayToJSON(t *
 	if got := gjson.GetBytes(gotBody, "quality").String(); got != "medium" {
 		t.Fatalf("quality = %q, want medium; body=%s", got, string(gotBody))
 	}
+	if gjson.GetBytes(gotBody, "response_format").Exists() {
+		t.Fatalf("response_format should not be sent to direct upstream: %s", string(gotBody))
+	}
 }
 
 func TestCodexOpenAIImageExecuteStreamUsesDirectEndpointAndForwardsChunks(t *testing.T) {
@@ -368,6 +379,9 @@ func TestCodexOpenAIImageExecuteStreamUsesDirectEndpointAndForwardsChunks(t *tes
 	}
 	if !gjson.GetBytes(gotBody, "stream").Bool() {
 		t.Fatalf("request stream = false/missing; body=%s", string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "response_format").Exists() {
+		t.Fatalf("response_format should not be sent to direct upstream: %s", string(gotBody))
 	}
 	if got := out.String(); got != string(streamPayload) {
 		t.Fatalf("stream payload = %q, want %q", got, string(streamPayload))
@@ -489,12 +503,14 @@ func TestCodexOpenAIImageExecuteStreamUsesDirectEditsMultipart(t *testing.T) {
 		{field: "size", want: "2048x2048"},
 		{field: "quality", want: "high"},
 		{field: "output_format", want: "png"},
-		{field: "response_format", want: "b64_json"},
 		{field: "stream", want: "true"},
 	} {
 		if got := gjson.GetBytes(gotBody, tt.field).String(); got != tt.want {
 			t.Fatalf("request %s = %q, want %q; body=%s", tt.field, got, tt.want, string(gotBody))
 		}
+	}
+	if gjson.GetBytes(gotBody, "response_format").Exists() {
+		t.Fatalf("response_format should not be sent to direct upstream: %s", string(gotBody))
 	}
 	if got := gjson.GetBytes(gotBody, "images.0.image_url").String(); got != "data:image/png;base64,aW1hZ2UtYnl0ZXM=" {
 		t.Fatalf("image = %q; body=%s", got, string(gotBody))
