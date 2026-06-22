@@ -1186,21 +1186,6 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 		return
 	}
 
-	images := make([]string, 0, len(imageFiles))
-	for _, fh := range imageFiles {
-		dataURL, err := multipartFileToDataURL(fh)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-				Error: handlers.ErrorDetail{
-					Message: fmt.Sprintf("Invalid request: %v", err),
-					Type:    "invalid_request_error",
-				},
-			})
-			return
-		}
-		images = append(images, dataURL)
-	}
-
 	responseFormat := strings.TrimSpace(c.PostForm("response_format"))
 	if responseFormat == "" {
 		responseFormat = "b64_json"
@@ -1222,6 +1207,22 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 		h.handleRoutedImages(c, imageReq, imageModel, responseFormat, stream)
 		return
 	}
+
+	images := make([]string, 0, len(imageFiles))
+	for _, fh := range imageFiles {
+		dataURL, err := multipartFileToDataURL(fh)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+				Error: handlers.ErrorDetail{
+					Message: fmt.Sprintf("Invalid request: %v", err),
+					Type:    "invalid_request_error",
+				},
+			})
+			return
+		}
+		images = append(images, dataURL)
+	}
+
 	if isXAIImagesModel(imageModel) {
 		aspectRatio := xaiImagesAspectRatio(c.PostForm("aspect_ratio"), "")
 		aspectRatio = xaiImagesAspectRatioFromSize(c.PostForm("size"), aspectRatio)

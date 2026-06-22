@@ -12,7 +12,6 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"net/textproto"
 	"sort"
 	"strconv"
 	"strings"
@@ -106,9 +105,6 @@ func (e *CodexExecutor) resolveGPTImage2BaseModel() string {
 }
 
 func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	if codexOpenAIImageIsEditsPath(helps.PayloadRequestPath(opts)) {
-		return e.executeOpenAIImageViaResponses(ctx, auth, req, opts)
-	}
 	prepared, errPrepare := codexPrepareOpenAIImageDirectRequest(req, opts, false)
 	if errPrepare != nil {
 		return resp, errPrepare
@@ -981,9 +977,6 @@ func logCodexImageCompletedWithoutOutput(ctx context.Context, payload []byte, re
 }
 
 func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	if codexOpenAIImageIsEditsPath(helps.PayloadRequestPath(opts)) {
-		return e.executeOpenAIImageResponsesStream(ctx, auth, req, opts)
-	}
 	prepared, errPrepare := codexPrepareOpenAIImageDirectRequest(req, opts, true)
 	if errPrepare != nil {
 		return nil, errPrepare
@@ -1389,76 +1382,6 @@ func codexOpenAIImageDirectModel(routeModel string) string {
 		return codexDefaultImageToolModel
 	}
 	return model
-}
-
-func codexCloneMIMEHeader(src textproto.MIMEHeader) textproto.MIMEHeader {
-	dst := make(textproto.MIMEHeader, len(src))
-	for key, values := range src {
-		dst[key] = append([]string(nil), values...)
-	}
-	return dst
-}
-
-func codexRewriteOpenAIImageDirectMultipartPayload(form *multipart.Form, model string, stream bool) ([]byte, string, error) {
-	if form == nil {
-		return nil, "", fmt.Errorf("multipart form is nil")
-	}
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	if model != "" {
-		if errWrite := writer.WriteField("model", model); errWrite != nil {
-			return nil, "", fmt.Errorf("write model field failed: %w", errWrite)
-		}
-	}
-	if stream {
-		if errWrite := writer.WriteField("stream", "true"); errWrite != nil {
-			return nil, "", fmt.Errorf("write stream field failed: %w", errWrite)
-		}
-	}
-	for key, values := range form.Value {
-		if key == "model" || key == "stream" {
-			continue
-		}
-		for _, value := range values {
-			if errWrite := writer.WriteField(key, value); errWrite != nil {
-				return nil, "", fmt.Errorf("write form field %s failed: %w", key, errWrite)
-			}
-		}
-	}
-	for key, files := range form.File {
-		for _, fileHeader := range files {
-			if fileHeader == nil {
-				continue
-			}
-			header := codexCloneMIMEHeader(fileHeader.Header)
-			header.Set("Content-Disposition", multipart.FileContentDisposition(key, fileHeader.Filename))
-			if header.Get("Content-Type") == "" {
-				header.Set("Content-Type", "application/octet-stream")
-			}
-			part, errCreate := writer.CreatePart(header)
-			if errCreate != nil {
-				return nil, "", fmt.Errorf("create file field %s failed: %w", key, errCreate)
-			}
-			src, errOpen := fileHeader.Open()
-			if errOpen != nil {
-				return nil, "", fmt.Errorf("open upload file failed: %w", errOpen)
-			}
-			_, errCopy := io.Copy(part, src)
-			if errClose := src.Close(); errClose != nil {
-				log.Errorf("codex openai images: close upload file error: %v", errClose)
-				if errCopy == nil {
-					errCopy = errClose
-				}
-			}
-			if errCopy != nil {
-				return nil, "", fmt.Errorf("copy upload file failed: %w", errCopy)
-			}
-		}
-	}
-	if errClose := writer.Close(); errClose != nil {
-		return nil, "", fmt.Errorf("close multipart writer failed: %w", errClose)
-	}
-	return body.Bytes(), writer.FormDataContentType(), nil
 }
 
 func codexBuildOpenAIImageDirectMultipartJSONPayload(form *multipart.Form, model string, stream bool) ([]byte, error) {
