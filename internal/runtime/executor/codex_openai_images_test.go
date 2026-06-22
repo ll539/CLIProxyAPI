@@ -1,12 +1,15 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,43 +23,85 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestCodexOpenAIImageExecuteReturnsOnResponseCompletedBeforeEOF(t *testing.T) {
+func TestCodexOpenAIImageExecuteUsesDirectGenerationsNonStream(t *testing.T) {
+	var gotPath, gotAccept, gotContentType string
+	var gotBody []byte
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(": keepalive\n"))
-		_, _ = w.Write(codexBuildSSEFrame("", codexImageCompletedPayload("AA==")))
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
+		gotPath = r.URL.Path
+		gotAccept = r.Header.Get("Accept")
+		gotContentType = r.Header.Get("Content-Type")
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			http.Error(w, errRead.Error(), http.StatusBadRequest)
+			return
 		}
-		select {
-		case <-r.Context().Done():
-		case <-time.After(2 * time.Second):
+		if gotPath != codexDirectImagesGenerations {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
 		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(codexDirectImageJSONResponse())
 	}))
 	defer server.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	started := time.Now()
-	resp, err := codexTestImageExecutor(server.URL).Execute(ctx, codexTestImageAuth(server.URL), codexTestImageRequest(), codexTestImageOptions())
-	elapsed := time.Since(started)
+	req := codexTestImageRequest()
+	req.Payload = []byte(`{"model":"gpt-image-2","prompt":"draw","response_format":"b64_json","size":"2048x2048","quality":"medium","output_format":"png","n":1}`)
+	resp, err := codexTestImageExecutor(server.URL).Execute(context.Background(), codexTestImageAuth(server.URL), req, codexTestImageOptions())
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("Execute() waited %v after response.completed; want quick return before EOF", elapsed)
+
+	if gotPath != codexDirectImagesGenerations {
+		t.Fatalf("path = %q, want %q", gotPath, codexDirectImagesGenerations)
 	}
+	if gotAccept != "application/json" {
+		t.Fatalf("Accept = %q, want application/json", gotAccept)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", gotContentType)
+	}
+	for _, tt := range []struct {
+		field string
+		want  string
+	}{
+		{field: "model", want: "gpt-image-2"},
+		{field: "prompt", want: "draw"},
+		{field: "size", want: "2048x2048"},
+		{field: "quality", want: "medium"},
+		{field: "output_format", want: "png"},
+	} {
+		if got := gjson.GetBytes(gotBody, tt.field).String(); got != tt.want {
+			t.Fatalf("request %s = %q, want %q; body=%s", tt.field, got, tt.want, string(gotBody))
+		}
+	}
+	if got := gjson.GetBytes(gotBody, "n").Int(); got != 1 {
+		t.Fatalf("request n = %d, want 1; body=%s", got, string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "stream").Exists() {
+		t.Fatalf("stream should be absent for non-stream direct request: %s", string(gotBody))
+	}
+
 	if got := gjson.GetBytes(resp.Payload, "data.0.b64_json").String(); got != "AA==" {
 		t.Fatalf("b64_json = %q, want AA==; payload=%s", got, string(resp.Payload))
 	}
+	if got := gjson.GetBytes(resp.Payload, "size").String(); got != "2048x2048" {
+		t.Fatalf("size = %q, want 2048x2048; payload=%s", got, string(resp.Payload))
+	}
+	if got := gjson.GetBytes(resp.Payload, "quality").String(); got != "medium" {
+		t.Fatalf("quality = %q, want medium; payload=%s", got, string(resp.Payload))
+	}
 }
 
-func TestCodexOpenAIImageExecutePreservesCompletedResponseShape(t *testing.T) {
+func TestCodexOpenAIImageExecutePreservesDirectResponseShape(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write(codexBuildSSEFrame("", []byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"AA==","revised_prompt":"draw revised","output_format":"png","size":"1024x1024","background":"transparent","quality":"high"}}`)))
-		_, _ = w.Write(codexBuildSSEFrame("", []byte(`{"type":"response.completed","response":{"created_at":123,"output":[],"tool_usage":{"image_gen":{"input_tokens":1,"output_tokens":2,"total_tokens":3}},"usage":{"input_tokens":4,"output_tokens":5,"total_tokens":9}}}`)))
+		if r.URL.Path != codexDirectImagesGenerations {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"created":123,"data":[{"b64_json":"AA==","revised_prompt":"draw revised","output_format":"png","size":"1024x1024","background":"transparent","quality":"high"}],"usage":{"total_tokens":3}}`))
 	}))
 	defer server.Close()
 
@@ -79,6 +124,233 @@ func TestCodexOpenAIImageExecutePreservesCompletedResponseShape(t *testing.T) {
 	}
 	if got := gjson.GetBytes(resp.Payload, "usage.total_tokens").Int(); got != 3 {
 		t.Fatalf("usage.total_tokens = %d, want 3; payload=%s", got, string(resp.Payload))
+	}
+}
+
+func TestCodexOpenAIImageExecuteUsesDirectEditsJSON(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			http.Error(w, errRead.Error(), http.StatusBadRequest)
+			return
+		}
+		if gotPath != codexDirectImagesEdits {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(codexDirectImageJSONResponse())
+	}))
+	defer server.Close()
+
+	req := cliproxyexecutor.Request{
+		Model:   "codex/gpt-image-2",
+		Payload: []byte(`{"model":"codex/gpt-image-2","prompt":"edit","images":[{"image_url":"data:image/png;base64,AA=="}],"mask":{"image_url":"data:image/png;base64,BB=="},"size":"2048x2048","quality":"high","output_format":"png","stream":true}`),
+	}
+	resp, err := codexTestImageExecutor(server.URL).Execute(context.Background(), codexTestImageAuth(server.URL), req, codexTestImageOptionsWithPath(codexImagesEditsPath))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if gotPath != codexDirectImagesEdits {
+		t.Fatalf("path = %q, want %q", gotPath, codexDirectImagesEdits)
+	}
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-image-2" {
+		t.Fatalf("request model = %q, want gpt-image-2; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "prompt").String(); got != "edit" {
+		t.Fatalf("request prompt = %q, want edit; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "images.0.image_url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("request image = %q; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "mask.image_url").String(); got != "data:image/png;base64,BB==" {
+		t.Fatalf("request mask = %q; body=%s", got, string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "stream").Exists() {
+		t.Fatalf("stream should be absent for non-stream edits request: %s", string(gotBody))
+	}
+	if got := gjson.GetBytes(resp.Payload, "data.0.b64_json").String(); got != "AA==" {
+		t.Fatalf("b64_json = %q, want AA==; payload=%s", got, string(resp.Payload))
+	}
+}
+
+func TestCodexOpenAIImageExecuteUsesDirectEditsMultipart(t *testing.T) {
+	var gotPath, gotAccept, gotContentType string
+	var gotFields map[string][]string
+	var gotFiles map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAccept = r.Header.Get("Accept")
+		gotContentType = r.Header.Get("Content-Type")
+		if gotPath != codexDirectImagesEdits {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		if errParse := r.ParseMultipartForm(32 << 20); errParse != nil {
+			http.Error(w, errParse.Error(), http.StatusBadRequest)
+			return
+		}
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
+		gotFields = r.MultipartForm.Value
+		gotFiles = map[string]string{}
+		for key, files := range r.MultipartForm.File {
+			if len(files) == 0 || files[0] == nil {
+				continue
+			}
+			f, errOpen := files[0].Open()
+			if errOpen != nil {
+				http.Error(w, errOpen.Error(), http.StatusBadRequest)
+				return
+			}
+			data, errRead := io.ReadAll(f)
+			if errClose := f.Close(); errClose != nil && errRead == nil {
+				errRead = errClose
+			}
+			if errRead != nil {
+				http.Error(w, errRead.Error(), http.StatusBadRequest)
+				return
+			}
+			gotFiles[key] = files[0].Header.Get("Content-Type") + ":" + string(data)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(codexDirectImageJSONResponse())
+	}))
+	defer server.Close()
+
+	body, contentType := codexTestMultipartImageEditBody(t)
+	req := cliproxyexecutor.Request{
+		Model:   "codex/gpt-image-2",
+		Payload: body,
+	}
+	opts := codexTestImageOptionsWithPath(codexImagesEditsPath)
+	opts.Headers = http.Header{"Content-Type": {contentType}}
+	resp, err := codexTestImageExecutor(server.URL).Execute(context.Background(), codexTestImageAuth(server.URL), req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if gotAccept != "application/json" {
+		t.Fatalf("Accept = %q, want application/json", gotAccept)
+	}
+	if !strings.HasPrefix(gotContentType, "multipart/form-data; boundary=") {
+		t.Fatalf("Content-Type = %q, want multipart/form-data boundary", gotContentType)
+	}
+	if got := gotFields["model"]; len(got) != 1 || got[0] != "gpt-image-2" {
+		t.Fatalf("model fields = %#v, want gpt-image-2", got)
+	}
+	if got := gotFields["prompt"]; len(got) != 1 || got[0] != "edit multipart" {
+		t.Fatalf("prompt fields = %#v, want edit multipart", got)
+	}
+	if got := gotFields["size"]; len(got) != 1 || got[0] != "2048x2048" {
+		t.Fatalf("size fields = %#v, want 2048x2048", got)
+	}
+	if got := gotFields["quality"]; len(got) != 1 || got[0] != "high" {
+		t.Fatalf("quality fields = %#v, want high", got)
+	}
+	if got := gotFields["stream"]; len(got) != 0 {
+		t.Fatalf("stream fields = %#v, want absent", got)
+	}
+	if got := gotFiles["image"]; got != "image/png:image-bytes" {
+		t.Fatalf("image file = %q, want image/png:image-bytes", got)
+	}
+	if got := gotFiles["mask"]; got != "image/png:mask-bytes" {
+		t.Fatalf("mask file = %q, want image/png:mask-bytes", got)
+	}
+	if got := gjson.GetBytes(resp.Payload, "data.0.b64_json").String(); got != "AA==" {
+		t.Fatalf("b64_json = %q, want AA==; payload=%s", got, string(resp.Payload))
+	}
+}
+
+func TestCodexOpenAIImageExecuteStreamUsesDirectEndpointAndForwardsChunks(t *testing.T) {
+	var gotPath, gotAccept string
+	var gotBody []byte
+	streamPayload := []byte("event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"AA==\",\"size\":\"2048x2048\",\"quality\":\"medium\"}\n\ndata: [DONE]\n\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAccept = r.Header.Get("Accept")
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			http.Error(w, errRead.Error(), http.StatusBadRequest)
+			return
+		}
+		if gotPath != codexDirectImagesGenerations {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(streamPayload)
+	}))
+	defer server.Close()
+
+	result, err := codexTestImageExecutor(server.URL).ExecuteStream(context.Background(), codexTestImageAuth(server.URL), codexTestImageRequest(), codexTestImageOptions())
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var out bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		out.Write(chunk.Payload)
+	}
+
+	if gotPath != codexDirectImagesGenerations {
+		t.Fatalf("path = %q, want %q", gotPath, codexDirectImagesGenerations)
+	}
+	if gotAccept != "text/event-stream" {
+		t.Fatalf("Accept = %q, want text/event-stream", gotAccept)
+	}
+	if !gjson.GetBytes(gotBody, "stream").Bool() {
+		t.Fatalf("request stream = false/missing; body=%s", string(gotBody))
+	}
+	if got := out.String(); got != string(streamPayload) {
+		t.Fatalf("stream payload = %q, want %q", got, string(streamPayload))
+	}
+}
+
+func TestCodexOpenAIImageExecuteDirectErrorDoesNotFallback(t *testing.T) {
+	var responsesHits int
+	var directHits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case codexDirectImagesGenerations:
+			directHits++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"direct failed"}}`))
+		case "/responses":
+			responsesHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(codexBuildSSEFrame("", codexImageCompletedPayload("AA==")))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, err := codexTestImageExecutor(server.URL).Execute(context.Background(), codexTestImageAuth(server.URL), codexTestImageRequest(), codexTestImageOptions())
+	if err == nil {
+		t.Fatal("Execute() error = nil, want direct upstream error")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("error = %T %v, want status %d", err, err, http.StatusBadGateway)
+	}
+	if directHits != 1 {
+		t.Fatalf("direct hits = %d, want 1", directHits)
+	}
+	if responsesHits != 0 {
+		t.Fatalf("/responses hits = %d, want 0", responsesHits)
 	}
 }
 
@@ -414,10 +686,14 @@ data: {"type":"error","id":"resp_safe","error":{"type":"rate_limit_error","code"
 
 func TestCodexOpenAIImageExecuteSuccessDoesNotIncludeUpstreamErrorSummary(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
+		if r.URL.Path != codexDirectImagesGenerations {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "11")
 		w.Header().Set("X-Request-Id", "req_success")
-		_, _ = w.Write(codexBuildSSEFrame("", codexImageCompletedPayload("AA==")))
+		_, _ = w.Write(codexDirectImageJSONResponse())
 	}))
 	defer server.Close()
 
@@ -540,12 +816,64 @@ func codexTestImageRequest() cliproxyexecutor.Request {
 }
 
 func codexTestImageOptions() cliproxyexecutor.Options {
+	return codexTestImageOptionsWithPath(codexImagesGenerationsPath)
+}
+
+func codexTestImageOptionsWithPath(path string) cliproxyexecutor.Options {
 	return cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString(codexOpenAIImageSourceFormat),
 		Metadata: map[string]any{
-			cliproxyexecutor.RequestPathMetadataKey: codexImagesGenerationsPath,
+			cliproxyexecutor.RequestPathMetadataKey: path,
 		},
 	}
+}
+
+func codexDirectImageJSONResponse() []byte {
+	return []byte(`{"created":123,"data":[{"b64_json":"AA==","revised_prompt":"draw revised","output_format":"png","size":"2048x2048","background":"transparent","quality":"medium"}],"usage":{"total_tokens":3}}`)
+}
+
+func codexTestMultipartImageEditBody(t *testing.T) ([]byte, string) {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "model", value: "codex/gpt-image-2"},
+		{name: "prompt", value: "edit multipart"},
+		{name: "size", value: "2048x2048"},
+		{name: "quality", value: "high"},
+		{name: "output_format", value: "png"},
+		{name: "stream", value: "true"},
+	} {
+		if errWrite := writer.WriteField(field.name, field.value); errWrite != nil {
+			t.Fatalf("write field %s: %v", field.name, errWrite)
+		}
+	}
+	if errWrite := codexWriteTestMultipartFile(writer, "image", "image.png", "image/png", []byte("image-bytes")); errWrite != nil {
+		t.Fatalf("write image file: %v", errWrite)
+	}
+	if errWrite := codexWriteTestMultipartFile(writer, "mask", "mask.png", "image/png", []byte("mask-bytes")); errWrite != nil {
+		t.Fatalf("write mask file: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+	return body.Bytes(), writer.FormDataContentType()
+}
+
+func codexWriteTestMultipartFile(writer *multipart.Writer, field, filename, contentType string, data []byte) error {
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", multipart.FileContentDisposition(field, filename))
+	header.Set("Content-Type", contentType)
+	part, errCreate := writer.CreatePart(header)
+	if errCreate != nil {
+		return errCreate
+	}
+	_, errWrite := part.Write(data)
+	return errWrite
 }
 
 func codexImageCompletedPayload(result string) []byte {

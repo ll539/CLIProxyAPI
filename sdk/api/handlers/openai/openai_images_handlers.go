@@ -1633,8 +1633,7 @@ func (h *OpenAIAPIHandler) collectRoutedImages(c *gin.Context, imageReq []byte, 
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	model := strings.TrimSpace(imageModel)
-	dataChan, upstreamHeaders, errChan := h.ExecuteImageStreamWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
-	out, errMsg := collectCompletedImageFrames(cliCtx, dataChan, errChan, responseFormat)
+	out, upstreamHeaders, errMsg := h.ExecuteImageWithAuthManager(cliCtx, xaiImagesHandlerType, model, imageReq, "")
 	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)

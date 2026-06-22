@@ -34,7 +34,13 @@ type imageBootstrapRetryExecutor struct {
 func (e *imageBootstrapRetryExecutor) Identifier() string { return "codex" }
 
 func (e *imageBootstrapRetryExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
-	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	return coreexecutor.Response{
+		Payload: []byte(`{"created":123,"data":[{"b64_json":"AA==","revised_prompt":"draw revised"}],"size":"2048x2048","quality":"medium","output_format":"png","usage":{"total_tokens":3}}`),
+		Headers: http.Header{"X-Upstream-Attempt": {"1"}},
+	}, nil
 }
 
 func (e *imageBootstrapRetryExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
@@ -505,7 +511,7 @@ data: {"type":"response.image_generation_call.partial_image","partial_image_inde
 	requireImagesStreamErrorContains(t, errMsg, "output_item_result_count=0")
 }
 
-func TestCollectRoutedImagesRetriesBeforeFirstImageFrame(t *testing.T) {
+func TestRoutedImagesGenerationsReturnsDirectOpenAIImagesJSON(t *testing.T) {
 	executor := &imageBootstrapRetryExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
@@ -532,9 +538,9 @@ func TestCollectRoutedImagesRetriesBeforeFirstImageFrame(t *testing.T) {
 		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
 	}, manager)
 	handler := NewOpenAIAPIHandler(base)
-	body := strings.NewReader(`{"model":"gpt-image-2","prompt":"edit this","images":[{"image_url":"data:image/png;base64,AA=="}]}`)
+	body := strings.NewReader(`{"model":"gpt-image-2","prompt":"draw","size":"2048x2048","quality":"medium","output_format":"png"}`)
 
-	resp := performImagesEndpointRequest(t, imagesEditsPath, "application/json", body, handler.ImagesEdits)
+	resp := performImagesEndpointRequest(t, imagesGenerationsPath, "application/json", body, handler.ImagesGenerations)
 
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
@@ -542,8 +548,20 @@ func TestCollectRoutedImagesRetriesBeforeFirstImageFrame(t *testing.T) {
 	if got := gjson.GetBytes(resp.Body.Bytes(), "data.0.b64_json").String(); got != "AA==" {
 		t.Fatalf("data.0.b64_json = %q, want AA==; body=%s", got, resp.Body.String())
 	}
-	if executor.Calls() != 2 {
-		t.Fatalf("calls = %d, want 2", executor.Calls())
+	if got := gjson.GetBytes(resp.Body.Bytes(), "size").String(); got != "2048x2048" {
+		t.Fatalf("size = %q, want 2048x2048; body=%s", got, resp.Body.String())
+	}
+	if got := gjson.GetBytes(resp.Body.Bytes(), "quality").String(); got != "medium" {
+		t.Fatalf("quality = %q, want medium; body=%s", got, resp.Body.String())
+	}
+	if got := gjson.GetBytes(resp.Body.Bytes(), "output_format").String(); got != "png" {
+		t.Fatalf("output_format = %q, want png; body=%s", got, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), `"size":"auto"`) || strings.Contains(resp.Body.String(), `"quality":"auto"`) {
+		t.Fatalf("response rewrote image meta to auto: %s", resp.Body.String())
+	}
+	if executor.Calls() != 1 {
+		t.Fatalf("calls = %d, want 1", executor.Calls())
 	}
 }
 

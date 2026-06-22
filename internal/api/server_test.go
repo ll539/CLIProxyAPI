@@ -306,6 +306,80 @@ func TestVideosRoutesKeepXAINativeAndExposeOpenAIPrefix(t *testing.T) {
 	}
 }
 
+func TestCodexDirectImagesRoutesUseOpenAIImagesHandlers(t *testing.T) {
+	server := newTestServer(t)
+
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "generations",
+			path: "/backend-api/codex/images/generations",
+			body: `{"model":"gpt-5.4-mini","prompt":"draw a square"}`,
+		},
+		{
+			name: "edits",
+			path: "/backend-api/codex/images/edits",
+			body: `{"model":"gpt-5.4-mini","prompt":"edit this","images":[{"image_url":"data:image/png;base64,AA=="}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer test-key")
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "/v1/images/generations") || !strings.Contains(rr.Body.String(), "/v1/images/edits") {
+				t.Fatalf("expected OpenAI images handler validation response, body=%s", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestCodexDirectImagesRoutesRespectDisableImageGeneration(t *testing.T) {
+	server := newTestServer(t)
+	server.handlers.Cfg.DisableImageGeneration = proxyconfig.DisableImageGenerationAll
+
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "generations",
+			path: "/backend-api/codex/images/generations",
+			body: `{"model":"gpt-image-2","prompt":"draw a square"}`,
+		},
+		{
+			name: "edits",
+			path: "/backend-api/codex/images/edits",
+			body: `{"model":"gpt-image-2","prompt":"edit this","images":[{"image_url":"data:image/png;base64,AA=="}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer test-key")
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
